@@ -33,7 +33,7 @@ contract Initializable {
         // prevent re-initializing of the contract
         require(initializing || isConstructor() || !initialized, "Initializable: already initialized");
 
-        // prevent initializer re-entry
+        // prevent early initializer lock release
         bool isTopLevelCall = !initializing;
         if (isTopLevelCall) {
             initializing = true;
@@ -42,7 +42,7 @@ contract Initializable {
 
         _;
 
-        // release re-entry lock
+        // release initializer lock
         if (isTopLevelCall) {
             initializing = false;
         }
