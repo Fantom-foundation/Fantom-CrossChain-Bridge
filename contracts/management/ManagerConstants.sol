@@ -20,6 +20,14 @@ contract ManagerConstants {
         return 3175000 * 1e18;
     }
 
+    // maxDelegatedRatio returns the maximal ratio between the amount of tokens staked
+    // by a validator himself and the amount of tokens delegated to the validator
+    // from 3rd party delegates.
+    function maxDelegatedRatio() public pure returns (uint256) {
+        // 0% = delegation disabled
+        return 0;
+    }
+
     // unstakePeriodTime returns the number of seconds between an unstake request
     // and the actual stake unlock time.
     // If a staker requests to withdraw, the withdraw amount is placed into a request
