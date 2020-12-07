@@ -47,6 +47,10 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     // getValidator represents the list of validators by their IDs
     mapping(uint256 => Validator) public getValidator;
 
+    // validatorMetadata stores encoded validator information in case
+    // validators wanted to present their details to the community
+    mapping(uint256 => bytes) public validatorMetadata;
+
     // getValidatorID represents the relation between a Validator address
     // and the ID of the Validator.
     mapping(address => uint256) public getValidatorID;
@@ -68,6 +72,10 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     // Map: Staker => ValidatorID => stashed amount
     mapping(address => mapping(uint256 => uint256)) public rewardsStash;
 
+    // rewardsPaid represents a container for rewards already paid for the given stake.
+    // Map: Staker => ValidatorID => stashed amount
+    mapping(address => mapping(uint256 => uint256)) public rewardsPaid;
+
     // lastValidatorID represents the ID of the latest validator;
     // it also represents the total number of Validators since a new validator
     // is assigned the next available ID and zero ID is skipped.
@@ -80,6 +88,14 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     // totalSlashedStake represents the total amount of staked tokens
     // slashed by the protocol due to validators malicious behaviour.
     uint256 public totalSlashedStake;
+
+    // rewardPerStakeTokenLast represents the last stored amount of rewards
+    // paid for a stake token.
+    uint256 public rewardPerStakeTokenLast;
+
+    // rewardPerStakeTokenUpdated represents the timestamp
+    // of the latest rewards per stake token update.
+    uint256 public rewardPerStakeTokenUpdated;
 
     // stakingToken represents the address of an ERC20 token used for staking
     // on the Bridge.
@@ -121,7 +137,7 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     }
 
     // ------------------------------
-    // business logic
+    // interface
     // ------------------------------
 
     // createValidator allows a new candidate to sign up as a validator
@@ -144,6 +160,18 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
 
         // process the stake
         _stake(_sender(), validatorID, amount);
+    }
+
+    // setValidatorMetadata stores the new metadata for the validator
+    // we don't validate the metadata here, please check the documentation
+    // to get the recommended and expected structure of the metadata
+    function setValidatorMetadata(bytes calldata metadata) external {
+        // validator must exist
+        uint256 validatorID = getValidatorID[_sender()];
+        require(0 < validatorID, "BridgeManager: unknown validator address");
+
+        // store the new metadata content
+        validatorMetadata[validatorID] = metadata;
     }
 
     // unstake decreases the stake of the given validator identified
@@ -180,19 +208,13 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         address delegate = _sender();
         require(canWithdraw(delegate, validatorID, requestID), "BridgeManager: can not withdraw");
 
-        // get the request amount and drop the request; we don't need it anymore
-        uint256 amount = getUnstakingRequest[delegate][validatorID][requestID].amount;
-        delete getUnstakingRequest[delegate][validatorID][requestID];
-
-        // do we slash the stake?
-        if (0 == getValidator[validatorID].status & STATUS_ERROR) {
-            // transfer tokens to the delegate
-            stakingToken.safeTransfer(delegate, amount);
-        } else {
-            // we don't transfer anything and just add the stake to total slash
-            totalSlashedStake = totalSlashedStake.add(amount);
-        }
+        // do the withdraw
+        _withdraw(delegate, validatorID, requestID);
     }
+
+    // ------------------------------
+    // business logic
+    // ------------------------------
 
     // _createValidator builds up the validator structure
     function _createValidator(address auth) internal {
@@ -260,6 +282,23 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         _notifyValidatorWeightChange(toValidatorID);
     }
 
+    // _withdraw transfers previously un-staked tokens back to the staker/delegator, if possible
+    // this is the place where we check for a slashing, if a validator did not behave correctly
+    function _withdraw(address delegate, uint256 validatorID, uint256 requestID) internal {
+        // get the request amount and drop the request; we don't need it anymore
+        uint256 amount = getUnstakingRequest[delegate][validatorID][requestID].amount;
+        delete getUnstakingRequest[delegate][validatorID][requestID];
+
+        // do we slash the stake?
+        if (0 == getValidator[validatorID].status & STATUS_ERROR) {
+            // transfer tokens to the delegate
+            stakingToken.safeTransfer(delegate, amount);
+        } else {
+            // we don't transfer anything and just add the stake to total slash
+            totalSlashedStake = totalSlashedStake.add(amount);
+        }
+    }
+
     // _validatorExists performs a check for a validator existence
     function _validatorExists(uint256 validatorID) view internal returns (bool) {
         return getValidator[validatorID].status > 0;
@@ -282,10 +321,21 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         return getValidator[validatorID].receivedStake <= _selfStake(validatorID).mul(maxDelegatedRatio()).div(Decimal.unit());
     }
 
+    // _deactivateValidator sets the validator account as withdrawn, if active
+    // inactive validator accounts can not be deactivated and trying to do so will revert
+    function _deactivateValidator(uint256 validatorID) internal {
+        // validator must exist and be active
+        require(0 == getValidator[validatorID].status & MASK_INACTIVE, "BridgeManager: invalid validator state");
+
+        // set withdrawn status
+        getValidator[validatorID].status = getValidator[validatorID].status | STATUS_WITHDRAWN;
+        getValidator[validatorID].deactivatedTime = _now();
+    }
+
     // _notifyValidatorWeightChange notifies a change of the validation power
     // of the given validator. Clients listening for this notification can act
     // accordingly.
-    function _notifyValidatorWeightChange(uint256 validatorID) public {
+    function _notifyValidatorWeightChange(uint256 validatorID) internal {
         // check for validator existence
         require(_validatorExists(validatorID), "BridgeManager: unknown validator");
 
@@ -298,6 +348,24 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
 
         // emit the event for the validator
         emit UpdatedValidatorWeight(validatorID, weight);
+    }
+
+    // rewardPerStakeToken calculates the reward share per single stake token.
+    // It's calculated from the amount of tokens rewarded per second
+    // and the total amount of staked tokens.
+    function rewardPerStakeToken() public view returns (uint256) {
+        // is there any stake?
+        if (0 == totalStake) {
+            return rewardPerStakeTokenLast;
+        }
+
+        // return current accumulated rewards per stake token
+        return rewardPerStakeTokenLast.add(
+            /* number of seconds passed from the last update */ _now().sub(rewardPerStakeTokenUpdated)
+            .mul(rewardRatePerStakeToken())
+            .mul(rewardPerTokenDecimalsCorrection)
+            .div(totalStake)
+        );
     }
 
     // ------------------------------
