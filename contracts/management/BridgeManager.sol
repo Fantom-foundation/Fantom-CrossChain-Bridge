@@ -77,6 +77,10 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     // all active Validators.
     uint256 public totalStake;
 
+    // totalSlashedStake represents the total amount of staked tokens
+    // slashed by the protocol due to validators malicious behaviour.
+    uint256 public totalSlashedStake;
+
     // stakingToken represents the address of an ERC20 token used for staking
     // on the Bridge.
     IERC20 public stakingToken;
@@ -135,25 +139,65 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         // validator must exist to receive stake
         require(_validatorExists(validatorID), "BridgeManager: unknown validator");
 
+        // stash accumulated rewards up to this point before the stake amount is updated
+        _stashRewards(_sender(), validatorID);
+
         // process the stake
         _stake(_sender(), validatorID, amount);
     }
 
     // unstake decreases the stake of the given validator identified
     // by the validator ID from the sender by the given amount of staking tokens.
-    // User chooses the request ID which must be unique and not used before.
-    function unstake(uint256 validatorID, uint256 requestID, uint256 amount) external {
+    // User chooses the request ID, which must be unique and not used before.
+    function unstake(uint256 validatorID, uint256 amount, uint256 requestID) external {
         // validator must exist to receive stake
         require(_validatorExists(validatorID), "BridgeManager: unknown validator");
+
+        // stash accumulated rewards so the staker doesn't loose any
+        _stashRewards(_sender(), validatorID);
 
         // process the unstake starter
         _unstake(requestID, _sender(), validatorID, amount);
     }
 
+    // canWithdraw checks if the given un-stake request for the given delegate and validator ID
+    // is already unlocked and ready to be withdrawn.
+    function canWithdraw(address delegate, uint256 validatorID, uint256 requestID) external view returns (bool) {
+        // if the validator dropped its validation account, delegations will unlock sooner
+        uint256 requestTime = getUnstakingRequest[delegate][validatorID][requestID].time;
+        if (0 < getValidator[validatorID].deactivatedTime && requestTime > getValidator[validatorID].deactivatedTime) {
+            requestTime = getValidator[validatorID].deactivatedTime;
+        }
+
+        return /* the request must exist */ 0 < requestTime &&
+        /* enough time passed from the unstaking */ _now() <= requestTime + unstakePeriodTime();
+    }
+
+    // withdraw transfers previously un-staked tokens back to the staker/delegator, if possible
+    // this is the place where we check for a slashing, if a validator did not behave correctly
+    function withdraw(uint256 validatorID, uint256 requestID) external {
+        // make sure the request can be withdrawn
+        address delegate = _sender();
+        require(canWithdraw(delegate, validatorID, requestID), "BridgeManager: can not withdraw");
+
+        // get the request amount and drop the request; we don't need it anymore
+        uint256 amount = getUnstakingRequest[delegate][validatorID][requestID].amount;
+        delete getUnstakingRequest[delegate][validatorID][requestID];
+
+        // do we slash the stake?
+        if (0 == getValidator[validatorID].status & STATUS_ERROR) {
+            // transfer tokens to the delegate
+            stakingToken.safeTransfer(delegate, amount);
+        } else {
+            // we don't transfer anything and just add the stake to total slash
+            totalSlashedStake = totalSlashedStake.add(amount);
+        }
+    }
+
     // _createValidator builds up the validator structure
     function _createValidator(address auth) internal {
         // make sure the validator does not exist yet
-        require(getValidatorID[auth] == 0, "BridgeManager: validator already exists");
+        require(0 == getValidatorID[auth], "BridgeManager: validator already exists");
 
         // what will be the new validator id
         uint256 validatorID = ++lastValidatorID;
@@ -166,18 +210,19 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     }
 
     // _stake processes a new stake of a validator
-    function _stake(address sender, uint256 toValidatorID, uint256 amount) internal {
+    function _stake(address delegator, uint256 toValidatorID, uint256 amount) internal {
         // make sure the staking request is valid
-        require(getValidator[toValidatorID].status & MASK_INACTIVE == 0, "BridgeManager: validator not active");
-        require(amount > 0, "BridgeManager: zero stake rejected");
-        require(amount <= stakingToken.allowance(sender, address(this)), "BridgeManager: allowance too low");
+        require(0 == getValidator[toValidatorID].status & MASK_INACTIVE, "BridgeManager: validator not active");
+        require(0 < amount, "BridgeManager: zero stake rejected");
+        require(amount <= stakingToken.allowance(delegator, address(this)), "BridgeManager: allowance too low");
 
         // transfer the stake tokens first
-        stakingToken.safeTransferFrom(sender, address(this), amount);
+        stakingToken.safeTransferFrom(delegator, address(this), amount);
 
         // remember the stake and add the staked amount to the validator's total stake value
+        // we add the amount using SafeMath to prevent overflow
         totalStake = totalStake.add(amount);
-        getDelegation[sender][toValidatorID] = getDelegation[sender][toValidatorID].add(amount);
+        getDelegation[delegator][toValidatorID] = getDelegation[delegator][toValidatorID].add(amount);
         getValidator[toValidatorID].receivedStake = getValidator[toValidatorID].receivedStake.add(amount);
 
         // make sure the validator stake is at least the min amount required
@@ -188,7 +233,34 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         _notifyValidatorWeightChange(toValidatorID);
     }
 
-    // _validatorExists performs a check for a validator existence.
+    // _unstake begins the process of lowering staked tokens by the given amount
+    function _unstake(uint256 id, address delegator, uint256 toValidatorID, uint256 amount) internal {
+        // validate the request
+        require(0 < amount, "BridgeManager: zero un-stake rejected");
+        require(amount <= getDelegation[delegator][toValidatorID], "BridgeManager: not enough staked");
+        require(0 == getUnstakingRequest[delegator][toValidatorID][id].amount, "BridgeManager: request ID already in use");
+
+        // update the staking picture
+        // we can subtract directly since we already tested the request validity and underflow can not happen
+        getDelegation[delegator][toValidatorID] -= amount;
+        getValidator[toValidatorID].receivedStake -= amount;
+        totalStake -= amount;
+
+        // check the remained stake validity and/or validator deactivation condition
+        require(_checkDelegatedStakeLimit(toValidatorID) || 0 == _selfStake(toValidatorID), "BridgeManager: delegations limit exceeded");
+        if (0 == _selfStake(toValidatorID)) {
+            _deactivateValidator(toValidatorID);
+        }
+
+        // add the request record
+        getUnstakingRequest[delegator][toValidatorID][id].amount = amount;
+        getUnstakingRequest[delegator][toValidatorID][id].time = _now();
+
+        // notify the update
+        _notifyValidatorWeightChange(toValidatorID);
+    }
+
+    // _validatorExists performs a check for a validator existence
     function _validatorExists(uint256 validatorID) view internal returns (bool) {
         return getValidator[validatorID].status > 0;
     }
