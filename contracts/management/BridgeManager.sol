@@ -8,10 +8,11 @@ import "../common/SafeERC20.sol";
 import "../ownership/Ownable.sol";
 import "../utils/Version.sol";
 import "./ManagerConstants.sol";
+import "./RewardDistribution.sol";
 
 // BridgeManager implements the Fantom CrossChain Bridge management
 // contract.
-contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
+contract BridgeManager is Initializable, Ownable, Context, ManagerConstants, RewardDistribution, Version {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
 
@@ -67,43 +68,22 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
     // Map: Staker => ValidatorID => RequestID => UnstakingRequest struct
     mapping(address => mapping(uint256 => mapping(uint256 => UnstakingRequest))) public getUnstakingRequest;
 
-    // rewardsStash represents a container where calculated rewards are stored before
-    // the owner asks for the refund.
-    // Map: Staker => ValidatorID => stashed amount
-    mapping(address => mapping(uint256 => uint256)) public rewardsStash;
-
-    // rewardsPaid represents a container for rewards already paid for the given stake.
-    // Map: Staker => ValidatorID => stashed amount
-    mapping(address => mapping(uint256 => uint256)) public rewardsPaid;
-
     // lastValidatorID represents the ID of the latest validator;
     // it also represents the total number of Validators since a new validator
     // is assigned the next available ID and zero ID is skipped.
     uint256 public lastValidatorID;
 
-    // totalStake represents the total amount of staked tokens across
-    // all active Validators.
-    uint256 public totalStake;
-
     // totalSlashedStake represents the total amount of staked tokens
     // slashed by the protocol due to validators malicious behaviour.
     uint256 public totalSlashedStake;
 
-    // rewardPerStakeTokenLast represents the last stored amount of rewards
-    // paid for a stake token.
-    uint256 public rewardPerStakeTokenLast;
-
-    // rewardPerStakeTokenUpdated represents the timestamp
-    // of the latest rewards per stake token update.
-    uint256 public rewardPerStakeTokenUpdated;
+    // totalStake represents the total amount of staked tokens across
+    // all active Validators.
+    uint256 totalStake;
 
     // stakingToken represents the address of an ERC20 token used for staking
     // on the Bridge.
     IERC20 public stakingToken;
-
-    // rewardToken represents the address of an ERC20 token used for staking
-    // rewards on the Bridge.
-    IERC20 public rewardToken;
 
     // validatorMetadata represents the metadata of a Validator by the ID;
     // please check documentation for the expected metadata structure (JSON object)
@@ -124,9 +104,11 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         // initialize the owner
         Ownable.initialize(msg.sender);
 
-        // setup the tokens
+        // setup the stake token
         stakingToken = IERC20(stToken);
-        rewardToken = IERC20(rwToken);
+
+        // setup rewards distribution
+        _initRewards(rwToken, initialRewardRate());
 
         // create the first genesis set of validators
         // we don't handle staking here, the stake
@@ -156,7 +138,7 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         require(_validatorExists(validatorID), "BridgeManager: unknown validator");
 
         // stash accumulated rewards up to this point before the stake amount is updated
-        _stashRewards(_sender(), validatorID);
+        rewardUpdate(_sender(), validatorID);
 
         // process the stake
         _stake(_sender(), validatorID, amount);
@@ -182,7 +164,7 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         require(_validatorExists(validatorID), "BridgeManager: unknown validator");
 
         // stash accumulated rewards so the staker doesn't loose any
-        _stashRewards(_sender(), validatorID);
+        rewardUpdate(_sender(), validatorID);
 
         // process the unstake starter
         _unstake(requestID, _sender(), validatorID, amount);
@@ -350,35 +332,24 @@ contract BridgeManager is Initializable, Ownable, ManagerConstants, Version {
         emit UpdatedValidatorWeight(validatorID, weight);
     }
 
-    // rewardPerStakeToken calculates the reward share per single stake token.
-    // It's calculated from the amount of tokens rewarded per second
-    // and the total amount of staked tokens.
-    function rewardPerStakeToken() public view returns (uint256) {
-        // is there any stake?
-        if (0 == totalStake) {
-            return rewardPerStakeTokenLast;
-        }
-
-        // return current accumulated rewards per stake token
-        return rewardPerStakeTokenLast.add(
-            /* number of seconds passed from the last update */ _now().sub(rewardPerStakeTokenUpdated)
-            .mul(rewardRatePerStakeToken())
-            .mul(rewardPerTokenDecimalsCorrection)
-            .div(totalStake)
-        );
-    }
-
     // ------------------------------
     // tooling
     // ------------------------------
 
-    // _sender returns the address of the current trx sender
-    function _sender() internal view returns (address) {
-        return msg.sender;
+    // getTotalStake returns the total amount of staked tokens for the reward
+    // distribution calculation.
+    function getStakeTotal() public view returns (uint256) {
+        return totalStake;
     }
 
-    // _now returns the current timestamp as available to the contract call
-    function _now() internal view returns (uint256) {
-        return block.timestamp;
+    // getStakeBy returns the amount of staked tokens of a specific staker/validator combo
+    // for the reward distribution calculation.
+    function getStakeBy(address staker, uint256 validatorID) internal returns (uint256) {
+        return getDelegation[staker][validatorID];
+    }
+
+    // isStakeJailed returns jail status of the given stake.
+    function isStakeJailed(address staker, uint256 validatorID) public view returns (bool) {
+        return (getValidator[validatorID].status & STATUS_ERROR != 0);
     }
 }
