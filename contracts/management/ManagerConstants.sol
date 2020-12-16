@@ -38,9 +38,9 @@ contract ManagerConstants {
         return 60 * 60 * 24 * 7;
     }
 
-    // rewardRatePerStakeToken returns the number of reward tokens rewarded for stake
+    // initialRewardRate returns the initial number of reward tokens rewarded for stake
     // per second.
-    function rewardRatePerStakeToken() public pure returns (uint256) {
+    function initialRewardRate() public pure returns (uint256) {
         // 25k tokens per day rounded; we don't really need to care about dust here
         return (25000 * 1e18) / (60 * 60 * 24);
     }
